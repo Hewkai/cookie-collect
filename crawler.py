@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from urllib.parse import urlparse, urljoin
 
 # -----------------------
 # Database setup
@@ -21,7 +22,8 @@ db = mysql.connector.connect(
 )
 cursor = db.cursor()
 
-cursor.execute("DROP TABLE IF EXISTS cookies")
+# reset cookie collect
+# cursor.execute("DROP TABLE IF EXISTS cookies")
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS cookies (
     id INT AUTO_INCREMENT PRIMARY KEY,
@@ -33,6 +35,9 @@ CREATE TABLE IF NOT EXISTS cookies (
     expires VARCHAR(50),
     httponly VARCHAR(3),
     action_type VARCHAR(20),
+    is_api_store BOOLEAN NULL,
+    samesite VARCHAR(20) NULL,
+    https BOOLEAN NULL,
     collected_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )
@@ -46,7 +51,6 @@ chrome_options = webdriver.ChromeOptions()
 # chrome_options.add_argument("--headless=new")
 chrome_options.add_argument("--disable-gpu")
 chrome_options.add_argument("--window-size=1920,1080")
-
 # Load your custom profile
 # Parent folder of all Chrome profiles
 chrome_options.add_argument(
@@ -79,6 +83,7 @@ driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
                         const now = new Date();
                         const setTime = now.toISOString();
                         let expireSeconds = "never";
+                        let samesite = "Unspecified"; 
 
                         parts.slice(1).forEach(p => {
                             if (p.toLowerCase().startsWith("expires=")) {
@@ -87,6 +92,12 @@ driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
                             } else if (p.toLowerCase().startsWith("max-age=")) {
                                 const seconds = parseInt(p.slice(8));
                                 if (!isNaN(seconds)) expireSeconds = seconds;
+                            } else if (p.toLowerCase().startsWith("samesite=")) {
+                                let ss = p.slice(9).toLowerCase();
+                                if (ss === "lax") samesite = "Lax";
+                                else if (ss === "strict") samesite = "Strict";
+                                else if (ss === "none") samesite = "None"; 
+                                else samesite = ss; 
                             }
                         });
 
@@ -106,6 +117,7 @@ driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
                             value: val || "",
                             set_time: setTime,
                             expires: (val === "" || expireSeconds === 0) ? 0 : expireSeconds,
+                            samesite: samesite,   
                             action: action,
                             from: "Document"
                         };
@@ -125,45 +137,72 @@ driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
 # -----------------------
 def save_cookies(site, cookies):
     for c in cookies:
-        domain = c.get('domain', '').lstrip('.').replace("www.", "") 
+        domain = c.get('domain', '').lstrip('.').replace("www.", "")
         path = c.get('path', '/')
-        expires = c.get('expires')
         httponly = c.get('httponly', 'No')
+        expires = c.get('expires')
+        samesite = c.get('samesite', 'Unspecified')
 
+        # Convert expires to integer timestamp if possible
+        try:
+            expires_ts = int(expires)
+        except (TypeError, ValueError):
+            expires_ts = None
+
+        # Check if identical cookie exists
         cursor.execute("""
-            SELECT *
+            SELECT name, value, domain, path, website, expires, httponly, samesite, action_type, is_api_store
             FROM cookies
             WHERE name=%s
             AND domain=%s
             AND path=%s
             AND website=%s
             AND value=%s
-            AND expires=%s
             AND httponly=%s
+            AND samesite=%s
             AND action_type=%s
-            ORDER BY last_seen DESC LIMIT 1
+            AND is_api_store=%s
+            ORDER BY last_seen DESC
+            LIMIT 1
         """, (
             c['name'],
             domain,
             path,
             site,
             c['value'],
-            c.get('expires'),
-            c.get('httponly', 'No'),
-            c.get('action_type', 'unknown')
+            httponly,
+            samesite,
+            c.get('action_type', 'unknown'),
+            c.get('is_api_store'),
         ))
-        row = cursor.fetchone()
 
-        # If row exists, it’s identical, skip insert
+        row = cursor.fetchone()
+        skip_insert = False
+
         if row:
+            try:
+                existing_expires_ts = int(row['expires'])
+            except (TypeError, ValueError):
+                existing_expires_ts = None
+
+            if expires_ts is not None and existing_expires_ts is not None:
+                diff = abs(existing_expires_ts - expires_ts)
+                if diff <= 100:
+                    skip_insert = True
+            else:
+                skip_insert = True
+
+        if skip_insert:
             continue
+
         try:
             collected_at = datetime.fromisoformat(c['collected_at'].replace("Z", "+00:00"))
         except Exception:
             collected_at = c['collected_at']
+
         cursor.execute("""
-            INSERT INTO cookies (website, name, value, domain, path, expires, httponly, action_type, collected_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            INSERT INTO cookies (website, name, value, domain, path, expires, httponly, samesite, action_type, is_api_store, collected_at,https)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             site,
             c['name'],
@@ -172,12 +211,17 @@ def save_cookies(site, cookies):
             path,
             expires,
             httponly,
+            samesite,
             c.get('action_type', 'unknown'),
-            collected_at
+            c.get('is_api_store'),
+            collected_at,
+            c.get('https')
         ))
 
     db.commit()
 
+def normalize_domain(netloc):
+    return netloc.lower().lstrip("www.")
 def track_cookies(driver, interval=1, stable_seconds=3, timeout=30):
     driver.execute_script("""
         if (!window.jsCookies) window.jsCookies = {};
@@ -197,16 +241,38 @@ def track_cookies(driver, interval=1, stable_seconds=3, timeout=30):
                     let action = "add";
                     if(window.lastSnapshot[name]) {
                         let old = window.lastSnapshot[name];
-                        if(old && (old.value !== c.value || old.expires !== c.expires)) action = "edit";
-                        else continue;
+                        if(old) {
+                            // Compare multiple fields
+                            if(old.value !== c.value ||
+                            old.expires !== c.expires ||
+                            old.path !== c.path ||
+                            old.domain !== c.domain ||
+                            old.samesite !== samesite) {
+                                action = "edit";
+                            } else {
+                                continue; // ไม่มีการเปลี่ยนแปลง
+                            }
+                        }
                     }
+
+                    // --- SameSite normalize ---
+                    let samesite = "Unspecified";
+                    if (c.sameSite) {
+                        let ss = c.sameSite.toLowerCase();
+                        if (ss === "lax") samesite = "Lax";
+                        else if (ss === "strict") samesite = "Strict";
+                        else if (ss === "none") samesite = "None";
+                        else samesite = c.sameSite; // fallback
+                    }
+
                     window.jsCookies[name] = {
                         name: name,
                         value: c.value || "",
-                        domain: c.domain || window.location.hostname,  // <- added domain
+                        domain: c.domain || window.location.hostname,
                         path: c.path || "/",
                         set_time: now,
                         expires: c.expires ? Math.floor((new Date(c.expires) - new Date())/1000) : "never",
+                        samesite: samesite,
                         action: action,
                         from: "cookieStore"
                     };
@@ -219,10 +285,11 @@ def track_cookies(driver, interval=1, stable_seconds=3, timeout=30):
                         window.jsCookies[name] = {
                             name: name,
                             value: "",
-                            domain: old.domain || window.location.hostname,  // <- added domain
+                            domain: old.domain || window.location.hostname,
                             path: old.path || "/",
                             set_time: now,
                             expires: 0,
+                            samesite: old.samesite || "Unspecified",
                             action: "delete",
                             from: "cookieStore"
                         };
@@ -262,7 +329,7 @@ def track_cookies(driver, interval=1, stable_seconds=3, timeout=30):
 # Main loop
 # -----------------------
 # "https://www.fandom.com/",
-websites = ["https://www.fandom.com/"]
+websites = ["https://www.burgerking.co.th"]
 
 for site in websites:
     print(f"🌍 Loading site: {site}")
@@ -270,7 +337,7 @@ for site in websites:
     driver.execute_script("window.jsCookies = {};") 
     driver.get(site)
     time.sleep(3)
-    max_pages = 6 
+    max_pages = 1
     scroll_pause_time = 1
     pages_visited = 0
     # -----------------------
@@ -304,6 +371,7 @@ for site in websites:
         for c in js_cookies:
             domain = c.get('domain') or base_domain
             expires = c.get('expires') or "never"
+            samesite = c.get('samesite') or "Unspecified"
             all_cookies.append({
                 "name": c['name'],
                 "value": c['value'],
@@ -311,7 +379,9 @@ for site in websites:
                 "path": "/",
                 "expires": expires,
                 "httponly": "No",
+                "samesite": samesite,
                 "action_type": "js-set:"+c['action'],
+                "is_api_store": True if c['from'] == "cookieStore" else False,
                 "collected_at": c['set_time']
             })
     except Exception as e:
@@ -335,11 +405,12 @@ for site in websites:
                 for l in links:
                     href = l.get_attribute("href")
                     if href:
-                        parsed_href = urlparse(href)
-                        # เช็กเฉพาะลิงก์ที่ domain ตรงกับ base_domain
-                        if parsed_href.netloc == base_domain:
-                            internal_links.append(href)
-
+                        # Convert relative URLs to absolute URLs
+                        full_url = urljoin(f"https://{base_domain}", href)
+                        parsed_href = urlparse(full_url)
+                        # Only include links with the same domain
+                        if normalize_domain(parsed_href.netloc) == normalize_domain(base_domain):
+                            internal_links.append(full_url)
                 if internal_links:
                     link_to_go = random.choice(internal_links)
                     driver.get(link_to_go)
@@ -361,6 +432,7 @@ for site in websites:
                         for c in js_cookies:
                             domain = c.get('domain') or base_domain
                             expires = c.get('expires') or "never"
+                            samesite = c.get('samesite') or "Unspecified"
                             all_cookies.append({
                                 "name": c['name'],
                                 "value": c['value'],
@@ -368,7 +440,9 @@ for site in websites:
                                 "path": "/",
                                 "expires": expires,
                                 "httponly": "No",
+                                "samesite": samesite,
                                 "action_type": "js-set:"+c['action'],
+                                "is_api_store": True if c['from'] == "cookieStore" else False,
                                 "collected_at": c['set_time']
                             })
                     except Exception as e:
@@ -400,10 +474,11 @@ for site in websites:
     #         "collected_at": setup_time
     #     })
     
-    # 3. Network cookies
+    cookies_dict = {}
     for request in driver.requests:
         if request.response and 'Set-Cookie' in request.response.headers:
-            # เวลาที่ server ระบุ (Date header)
+            is_https = 1 if request.url.lower().startswith("https://") else 0
+
             request_time = request.date
             server_time = request.response.headers.get('Date')
             if server_time:
@@ -411,10 +486,12 @@ for site in websites:
                 try:
                     server_time_dt = parsedate_to_datetime(server_time)
                 except:
-                    server_time_dt = request_time  # fallback
+                    server_time_dt = request_time
             else:
                 server_time_dt = request_time
+
             cookie_headers = request.response.headers.get_all('Set-Cookie') if hasattr(request.response.headers, 'get_all') else [request.response.headers['Set-Cookie']]
+
             for cookie_str in cookie_headers:
                 parts = cookie_str.split(';')
                 name_value = parts[0].split('=')
@@ -424,6 +501,8 @@ for site in websites:
                 path = "/"
                 httponly = "Yes" if "HttpOnly" in cookie_str else "No"
                 expires = "never"
+                samesite = "Unspecified"  
+
                 for p in parts[1:]:
                     p = p.strip()
                     if p.lower().startswith("domain="):
@@ -432,8 +511,10 @@ for site in websites:
                         path = p[5:]
                     elif p.lower().startswith("expires="):
                         expires = p[8:]
+                    elif p.lower().startswith("samesite="):
+                        samesite = p[9:].capitalize()
 
-                # คำนวณ expire เป็นวินาที
+                # calculate expire seconds
                 if expires and expires != "never":
                     from email.utils import parsedate_to_datetime
                     try:
@@ -445,6 +526,51 @@ for site in websites:
                         expire_seconds = "never"
                 else:
                     expire_seconds = "never"
+
+                key = (name, domain, path)
+                if key in cookies_dict:
+                    # cookie exists
+                    prev_cookie = cookies_dict[key]
+                    if expire_seconds == 0 or value == "":
+                        action_type = "network:delete"
+                        del cookies_dict[key]
+                    else:
+                        # check if value or properties changed
+                        if (prev_cookie['value'] != value or prev_cookie['expires'] != expire_seconds 
+                            or prev_cookie['httponly'] != httponly or prev_cookie['samesite'] != samesite):
+                            action_type = "network:edit"
+                            cookies_dict[key] = {
+                                "name": name,
+                                "value": value,
+                                "domain": domain,
+                                "path": path,
+                                "expires": expire_seconds,
+                                "httponly": httponly,
+                                "samesite": samesite,
+                                "collected_at": server_time_dt,
+                                "https": is_https
+                            }
+                        else:
+                            # no change
+                            continue
+                else:
+                    # new cookie
+                    if expire_seconds == 0 or value == "":
+                        action_type = "network:delete"  # unlikely, but just in case
+                    else:
+                        action_type = "network:add"
+                        cookies_dict[key] = {
+                            "name": name,
+                            "value": value,
+                            "domain": domain,
+                            "path": path,
+                            "expires": expire_seconds,
+                            "httponly": httponly,
+                            "samesite": samesite,
+                            "collected_at": server_time_dt,
+                            "https": is_https
+                        }
+
                 all_cookies.append({
                     "name": name,
                     "value": value,
@@ -452,10 +578,40 @@ for site in websites:
                     "path": path,
                     "expires": expire_seconds,
                     "httponly": httponly,
-                    "action_type": "network",
-                    "collected_at": server_time_dt
+                    "samesite": samesite,
+                    "action_type": action_type,
+                    "collected_at": server_time_dt,
+                    "https": is_https
                 })
+    sent_cookies = []
 
+    ignore_extensions = ('.css', '.js', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.woff', '.woff2', '.ttf', '.ico')
+
+    # for request in driver.requests:
+    #     # ตรวจเฉพาะ request ที่ browser ส่งออกจริง
+    #     if request.response:
+    #         url = request.url.lower()
+    #         # ข้าม static files
+    #         if url.endswith(ignore_extensions):
+    #             continue
+
+    #         cookie_header = request.headers.get('Cookie')
+    #         if cookie_header:
+    #             cookies = cookie_header.split('; ')
+    #             for c in cookies:
+    #                 name_value = c.split('=', 1)
+    #                 name = name_value[0]
+    #                 value = name_value[1] if len(name_value) > 1 else ""
+                    
+    #                 sent_cookies.append({
+    #                     "name": name,
+    #                     "value": value,
+    #                     "url": request.url
+    #                 })
+
+    # แสดงผล
+    # for c in sent_cookies:
+    #     print(f"Cookie {c['name']} = {c['value']} sent to {c['url']}")
     # -----------------------
     # Save cookies
     # -----------------------
